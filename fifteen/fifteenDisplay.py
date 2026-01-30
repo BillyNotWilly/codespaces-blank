@@ -1,14 +1,12 @@
 import sys
 import random
+import threading
+import time
 import pygame
 
-# Try importing Board from the local module
-try:
-    from fifteenGame import Board
-    from fifteenSolver import next_move_astar
-except Exception:
-    from fifteen.fifteenGame import Board
-    from fifteen.fifteenSolver import next_move_astar
+# Import modules
+from fifteenGame import Board
+from fifteenSolver import next_move_astar, astar, greedy_best_first
 
 
 WINDOW_PADDING = 20
@@ -33,7 +31,84 @@ def scramble_board(size=4, moves=200):
     return b
 
 
+def load_board_from_file(filepath):
+    """Load a board from a file.
+    
+    File format:
+    - First line: board size n
+    - Next n lines: n space-separated integers
+    
+    Returns: (Board, size) or (None, None) if file is empty or doesn't exist
+    """
+    try:
+        with open(filepath, 'r') as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+            
+        if not lines:
+            return None, None
+        
+        # First line is the board size
+        size = int(lines[0])
+        
+        # Next n lines should contain the board
+        if len(lines) < size + 1:
+            print(f"Error: Expected {size} lines of board data, got {len(lines) - 1}")
+            return None, None
+        
+        # Parse the board
+        board_data = []
+        for i in range(1, size + 1):
+            row = list(map(int, lines[i].split()))
+            if len(row) != size:
+                print(f"Error: Row {i} has {len(row)} elements, expected {size}")
+                return None, None
+            board_data.extend(row)
+        
+        # Create and return the board
+        board = Board(board_data)
+        return board, size
+    except FileNotFoundError:
+        return None, None
+    except (ValueError, IndexError) as e:
+        print(f"Error parsing board file: {e}")
+        return None, None
+
+
 HIGHLIGHT_MS = 400  # milliseconds
+
+
+def _start_astar_search(board, time_limit=5.0, setter=None):
+    """Run A* in a background thread and call setter(result, board_hash) when done."""
+    def _worker(bcopy, tlimit, cb):
+        try:
+            path = astar(bcopy, time_limit=tlimit)
+        except Exception:
+            path = None
+        board_hash = tuple(bcopy.tiles)
+        if cb:
+            cb(path, board_hash)
+
+    th = threading.Thread(target=_worker, args=(board.copy(), time_limit, setter))
+    th.daemon = True
+    th.start()
+    return th
+
+
+def _start_greedy_search(board, time_limit=5.0, setter=None):
+    """Run Greedy Best First Search in a background thread and call setter(result, board_hash) when done."""
+    def _worker(bcopy, tlimit, cb):
+        try:
+            path = greedy_best_first(bcopy, time_limit=tlimit)
+        except Exception:
+            path = None
+        board_hash = tuple(bcopy.tiles)
+        if cb:
+            cb(path, board_hash)
+
+    th = threading.Thread(target=_worker, args=(board.copy(), time_limit, setter))
+    th.daemon = True
+    th.start()
+    return th
 
 
 def draw_board(screen, board, font, last_moved=None, last_move_time=0, best_move=None):
@@ -105,12 +180,34 @@ def main():
     pygame.init()
     pygame.display.set_caption("15-Puzzle")
 
+    # Check if a board file is provided as command-line argument
+    board = None
     size = 4
-    board = scramble_board(size=size, moves=300)
+    if len(sys.argv) > 1:
+        board, size = load_board_from_file(sys.argv[1])
+    
+    # If no file was provided or file was empty, create a random 4x4 board
+    if board is None:
+        size = 4
+        board = scramble_board(size=size, moves=300)
+    
     # Keep a copy of the starting scrambled board so we can reset to it
     start_board = board.copy()
     # history stores previous boards so we can undo moves
     history = []
+
+    # astar search state (async)
+    search_in_progress = False
+    search_thread = None
+    search_path = None  # list of moves if found
+    search_board_hash = None  # tuple(board.tiles) for which search was run
+    search_start_time = None  # time when search was started
+    search_elapsed_time = None  # elapsed time when search completed
+    search_type = None  # 'astar' or 'greedy'
+    auto_run_mode = False
+    auto_run_index = 0
+    auto_run_interval_ms = 600
+    last_auto_step_time = 0
 
     win_w = size * TILE_SIZE + WINDOW_PADDING * 2 + PANEL_WIDTH
     win_h = size * TILE_SIZE + WINDOW_PADDING * 2
@@ -123,6 +220,9 @@ def main():
     moves_count = 0
     solver_cached = None
     solver_board_hash = None
+    cached_cur_h = None
+    cached_neigh_h = None
+    cached_board_hash = None
     draw_board(screen, board, font, last_moved, last_move_time)
 
     running = True
@@ -138,6 +238,8 @@ def main():
 
                 # Undo last move
                 if event.key == pygame.K_u:
+                    # cancel any pending confirm or running auto-run
+                    auto_run_mode = False
                     if history:
                         board = history.pop()
                         moves_count = max(0, moves_count - 1)
@@ -148,12 +250,91 @@ def main():
 
                 # Reset board to starting scrambled position
                 if event.key == pygame.K_r:
+                    # cancel search and auto-run
+                    auto_run_mode = False
+                    search_in_progress = False
                     board = start_board.copy()
                     history.clear()
                     moves_count = 0
                     last_moved = None
                     last_move_time = pygame.time.get_ticks()
                     solver_board_hash = None
+                    search_path = None
+                    search_board_hash = None
+                    continue
+
+                # New random board
+                if event.key == pygame.K_n:
+                    # cancel search and auto-run
+                    auto_run_mode = False
+                    search_in_progress = False
+                    board = scramble_board(size=size, moves=300)
+                    start_board = board.copy()  # update start_board so reset goes to this new board
+                    history.clear()
+                    moves_count = 0
+                    last_moved = None
+                    last_move_time = pygame.time.get_ticks()
+                    solver_board_hash = None
+                    search_path = None
+                    search_board_hash = None
+                    continue
+                if event.key == pygame.K_s:
+                    if not search_in_progress:
+                        # start async search
+                        search_in_progress = True
+                        search_path = None
+                        search_board_hash = tuple(board.tiles)
+                        search_start_time = time.time()
+                        search_elapsed_time = None
+                        search_type = 'astar'
+
+                        def _setter(result, bh):
+                            nonlocal search_in_progress, search_path, search_board_hash, search_elapsed_time, search_start_time
+                            search_in_progress = False
+                            search_path = result
+                            search_board_hash = bh
+                            if search_start_time is not None:
+                                search_elapsed_time = time.time() - search_start_time
+
+                        search_thread = _start_astar_search(board, time_limit=10.0, setter=_setter)
+                    continue
+
+                # start Greedy Best First search for full solution
+                if event.key == pygame.K_g:
+                    if not search_in_progress:
+                        # start async search
+                        search_in_progress = True
+                        search_path = None
+                        search_board_hash = tuple(board.tiles)
+                        search_start_time = time.time()
+                        search_elapsed_time = None
+                        search_type = 'greedy'
+
+                        def _setter(result, bh):
+                            nonlocal search_in_progress, search_path, search_board_hash, search_elapsed_time, search_start_time
+                            search_in_progress = False
+                            search_path = result
+                            search_board_hash = bh
+                            if search_start_time is not None:
+                                search_elapsed_time = time.time() - search_start_time
+
+                        search_thread = _start_greedy_search(board, time_limit=10.0, setter=_setter)
+                    continue
+
+                # Run solution with SPACE
+                if event.key == pygame.K_SPACE:
+                    # if a solution is cached and it applies to current board, run it
+                    if search_path is not None:
+                        # require the solution to be for current board
+                        if tuple(board.tiles) == search_board_hash:
+                            # start auto-run immediately
+                            auto_run_mode = True
+                            auto_run_index = 0
+                            last_auto_step_time = pygame.time.get_ticks()
+                    continue
+
+                # cancel pending confirm
+                if event.key == pygame.K_c:
                     continue
 
                 move = None
@@ -200,19 +381,59 @@ def main():
             pygame.display.set_caption("15-Puzzle")
 
         # compute heuristics and best move (run solver with short timeout when board changed)
-        cur_h = board.manhattan()
-        neigh_h = {}
-        for m in ['up','down','left','right']:
-            if m in board.valid_moves():
-                nb = board.apply_move(m)
-                neigh_h[m] = nb.manhattan()
+        board_hash = tuple(board.tiles)
+        if board_hash != cached_board_hash:
+            cached_board_hash = board_hash
+            cached_cur_h = board.manhattan()
+            cached_neigh_h = {}
+            for m in ['up','down','left','right']:
+                if m in board.valid_moves():
+                    nb = board.apply_move(m)
+                    cached_neigh_h[m] = nb.manhattan()
+
+        cur_h = cached_cur_h
+        neigh_h = cached_neigh_h
 
         board_hash = tuple(board.tiles)
         if board_hash != solver_board_hash:
             solver_board_hash = board_hash
-            solver_cached = next_move_astar(board, time_limit=0.5)
+            solver_cached = next_move_astar(board, time_limit=0.2)
 
         best_move = solver_cached
+
+        # handle auto-run execution if active
+        if auto_run_mode and search_path and auto_run_index < len(search_path):
+            now = pygame.time.get_ticks()
+            if now - last_auto_step_time >= auto_run_interval_ms:
+                # apply next move
+                mv = search_path[auto_run_index]
+                if mv in board.valid_moves():
+                    history.append(board.copy())
+                    zr, zc = board.positions[0]
+                    if mv == 'up':
+                        moved_coord = (zr + 1, zc)
+                    elif mv == 'down':
+                        moved_coord = (zr - 1, zc)
+                    elif mv == 'left':
+                        moved_coord = (zr, zc + 1)
+                    else:
+                        moved_coord = (zr, zc - 1)
+
+                    board = board.apply_move(mv)
+                    last_moved = moved_coord
+                    last_move_time = now
+                    moves_count += 1
+                else:
+                    # solution no longer valid
+                    auto_run_mode = False
+                    search_path = None
+                auto_run_index += 1
+                last_auto_step_time = now
+
+            # finished
+            if auto_run_index >= len(search_path):
+                auto_run_mode = False
+                search_path = None
 
         draw_board(screen, board, font, last_moved, last_move_time, best_move)
 
@@ -245,8 +466,32 @@ def main():
             screen.blit(text, (info_x, y))
             y += 20
 
+        # A* best move hint (single-step suggestion)
+        astar_hint = 'none' if solver_cached is None else solver_cached
+        text = small.render(f"A* best: {astar_hint}", True, (0,0,0))
+        screen.blit(text, (info_x, y)); y += 22
+
+        # search status / solution info
+        if search_in_progress:
+            type_str = search_type.upper() if search_type else "A*"
+            text = small.render(f"{type_str}: searching...", True, (200,0,0))
+            screen.blit(text, (info_x, y)); y += 22
+        elif search_path is not None:
+            type_str = search_type.upper() if search_type else "A*"
+            time_str = f" ({search_elapsed_time:.2f}s)" if search_elapsed_time is not None else ""
+            if tuple(board.tiles) == search_board_hash:
+                text = small.render(f"{type_str} found: {len(search_path)} moves{time_str}", True, (0,120,0))
+            else:
+                text = small.render(f"{type_str} found (stale): {len(search_path)} moves{time_str}", True, (120,120,0))
+            screen.blit(text, (info_x, y)); y += 22
+            text = small.render("Press SPACE to run solution", True, (0,0,0))
+            screen.blit(text, (info_x, y)); y += 22
+        else:
+            text = small.render("Solver: no solution cached", True, (0,0,0))
+            screen.blit(text, (info_x, y)); y += 22
+
         # controls hint
-        text = small.render("u: undo  r: reset", True, (0,0,0))
+        text = small.render("u: undo  r: reset  n: new  s: search", True, (0,0,0))
         screen.blit(text, (info_x, y))
         y += 24
 
@@ -256,7 +501,6 @@ def main():
 
     pygame.quit()
     sys.exit(0)
-
 
 if __name__ == '__main__':
     main()

@@ -79,10 +79,10 @@ class Board:
 		is the direction the tile moves (into the blank's square).
 		"""
 		if move not in ("up", "down", "left", "right"):
-			return self.copy()
+			return self
 
 		if move not in self.valid_moves():
-			return self.copy()
+			return self
 
 		new = self.copy()
 		zr, zc = new.positions[0]
